@@ -18,15 +18,19 @@ final architectural state, so the model is self-verifying.
 - **Explicit register renaming** — the Physical Register File (PRF) holds data;
   the reservation stations and ROB hold **physical tags only**.
 - **2-way superscalar** fetch / dispatch / commit.
-- **CAM-free wakeup** via a **Ready Table** (one bit per physical register): set
-  at writeback, cleared at rename, indexed by the RS at select — exactly what the
-  standard-cell RTL target (no RAM/CAM macros) requires.
+- **Per-entry V1/V2 valid bits** (Tomasulo-style wakeup, matching the RTL RS
+  field layout): each reservation-station slot stores a valid bit per source;
+  initialised at dispatch, set by CDB tag-match broadcast, read at select. A
+  global Ready Table backs the dispatch-time initialisation and flush rebuild.
 - **Reorder Buffer (ROB)** with precise, in-order commit; the old destination
-  physical register (`Told`) is freed at commit.
-- **3 split reservation stations** feeding distinct functional-unit clusters:
-  - `RS_LoadBranch` → loads, stores, branches, jumps
-  - `RS_Int` → `ADD/SUB/AND/OR/XOR/SLL/SRL/SLT` (+ immediate forms)
+  physical register (`Told`) is freed at commit. Maintains the RTL pointers
+  `oldest / newest / non_speculative_last / newest_store`.
+- **4 split reservation stations**, one per functional-unit cluster, each with
+  the RTL field layout:
+  - `RS_Int` → `ADD/SUB/AND/OR/XOR/SLL/SRL/SLT` (+ imm) → ALUs
   - `RS_MulDiv` → `MULT` (pipelined), `DIV` (non-pipelined)
+  - `RS_LoadStore` → `LW`/`SW` → Load/Store unit
+  - `RS_Branch` → `BEQZ/BNEZ`, `J/JR/JAL/JALR` → Branch unit
 - **Common Data Bus** with 2 ports and fixed-priority arbitration
   (DIV > MUL > LU > BU > ALU); losers are held in the FU and retried next cycle.
 - **Precise memory model** — stores write memory **only at commit**; loads are
@@ -90,9 +94,12 @@ Initial state for `test.s` (set in `main.build_config()`):
 | Jump to start | `Reset` |
 | Jump to end | `End` |
 
-Panels: RAT (spec + committed), Free List, BHT/predictor log, ROB, **PRF values**,
-the three reservation stations (with **Imm** column), functional units, CDB, and a
-pipeline-stage view. Cells that changed since the previous cycle are highlighted.
+Panels: RAT (spec + committed), Free List, BHT/predictor log, ROB (with the
+`oldest/newest/non_spec_last/newest_store` pointer markers), **PRF values**, the
+four reservation stations (each with its RTL field layout — `S1/V1/S2/V2/Imm/D`
+for Int/MulDiv/LoadStore, `reg/V/off/use_reg/cond` for Branch), functional units,
+CDB, and a pipeline-stage view. Cells that changed since the previous cycle are
+highlighted.
 
 ---
 
@@ -102,7 +109,7 @@ pipeline-stage view. Cells that changed since the previous cycle are highlighted
 |---|---|
 | `instructions.py` | `Opcode`/`FUClass` enums, `Instruction`, opcode→(RS, semantics, flags) table, `w32` |
 | `parser.py` | two-pass DLX assembler (labels, comments `;`/`#`/`//`, `off(base)`) |
-| `structures.py` | `Config`, `DynInst`, PRF/ARF/RAT/FreeList/ReadyTable/ROB, 3 RS, FU model, `DataMemory`, `BranchPredictor` |
+| `structures.py` | `Config`, `DynInst`, PRF/ARF/RAT/FreeList/ReadyTable/ROB (+pointers), 4 RS (V1/V2 valid bits), FU model, `DataMemory`, `BranchPredictor` |
 | `simulator.py` | the pipeline + per-cycle `CycleSnapshot`; flush/recovery |
 | `gui.py` | Tkinter snapshot viewer |
 | `main.py` | entry point (GUI default, `--console`), golden in-order self-check |
@@ -125,7 +132,7 @@ Defaults live in `structures.Config` and can be overridden when constructing a
 | `n_phys` | 64 | physical registers |
 | `n_arch` | 32 | architectural registers |
 | `rob_size` | 32 | ROB entries |
-| `rs_int` / `rs_muldiv` / `rs_loadbranch` | 8 / 4 / 8 | RS sizes |
+| `rs_int` / `rs_muldiv` / `rs_loadstore` / `rs_branch` | 8 / 4 / 4 / 4 | RS sizes |
 | `width` | 2 | superscalar width |
 | `cdb_ports` | 2 | CDB write ports |
 | `n_alu` | 2 | ALU units |

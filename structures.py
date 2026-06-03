@@ -16,11 +16,13 @@ Design highlights (matching the team architecture document):
   On a branch flush we simply copy ``arch_rat`` back into ``RAT`` and rebuild the
   free list -- a one-shot, CAM-free recovery.
 
-* **Ready Table instead of CAM wakeup.**  A reservation station does *not*
-  compare its source tags against the CDB associatively.  Instead a global
-  ``ReadyTable`` has one bit per physical register; a writeback sets the bit,
-  rename clears it, and the RS just *indexes* the table with its source tags at
-  select time.  This is the "anti-CAM" wakeup from the architecture doc.
+* **Per-entry V1/V2 valid bits (Tomasulo-style wakeup).**  Every reservation
+  station entry stores a *valid* bit per source operand.  At dispatch the bits
+  are initialised from the global ``ReadyTable`` (was the producer already
+  done?); thereafter a CDB writeback *broadcasts* its destination tag and every
+  RS entry whose source tag matches sets the corresponding valid bit.  An entry
+  becomes selectable once all its used valid bits are set.  (The ``ReadyTable``
+  is retained for dispatch-time initialisation, flush rebuild, and the GUI.)
 
 * **Stores live in the ROB.**  A store allocates no physical register; its
   address/data are written into its ROB entry at execute and the memory write
@@ -47,7 +49,8 @@ class Config:
     rob_size: int = 32         # reorder-buffer entries
     rs_int: int = 8            # RS_Int entries
     rs_muldiv: int = 4         # RS_MulDiv entries
-    rs_loadbranch: int = 8     # RS_LoadBranch entries
+    rs_loadstore: int = 4      # RS_LoadStore entries
+    rs_branch: int = 4         # RS_Branch entries
     width: int = 2             # superscalar width (fetch/dispatch/commit per cyc)
     cdb_ports: int = 2         # common-data-bus broadcast ports per cycle
     n_alu: int = 2             # ALU units behind RS_Int
@@ -216,12 +219,24 @@ class ROBEntry:
 
 
 class ROB:
-    """Circular FIFO that enforces in-order allocation and in-order commit."""
+    """Circular FIFO that enforces in-order allocation and in-order commit.
+
+    The RTL exposes four maintained pointers (see the ROB field diagram):
+
+    * ``oldest``  -- the head, the next entry eligible to commit.
+    * ``newest``  -- the tail, the next free slot to allocate into.
+    * ``non_speculative_last`` -- index of the youngest entry that is *not*
+      shadowed by an older unresolved branch.  Everything from ``oldest`` up to
+      and including this pointer is non-speculative; younger entries are
+      speculative.  Loads may only execute inside the non-speculative region.
+    * ``newest_store`` -- index of the youngest store still in the ROB, used by
+      loads for conservative ordering (a load waits for older stores).
+    """
     def __init__(self, size: int):
         self.size = size
         self.buf: list[Optional[ROBEntry]] = [None] * size
         self.head = 0     # oldest (next to commit)
-        self.tail = 0     # next free slot
+        self.tail = 0     # next free slot (newest)
         self.count = 0
 
     def full(self) -> bool:
@@ -259,34 +274,87 @@ class ROB:
             out.append(self.buf[(self.head + i) % self.size])
         return out
 
+    # ---- maintained pointers ------------------------------------------------
+    def oldest_idx(self) -> Optional[int]:
+        return self.head if self.count else None
+
+    def newest_idx(self) -> Optional[int]:
+        """Index of the youngest live entry (one before the tail)."""
+        if not self.count:
+            return None
+        return (self.tail - 1) % self.size
+
+    def non_speculative_last_idx(self) -> Optional[int]:
+        """Youngest entry not shadowed by an older *unresolved* branch/jump.
+
+        We walk oldest->youngest and stop just before the first control
+        instruction that has not completed yet (its outcome is still unknown,
+        so everything after it is speculative)."""
+        last = None
+        for i in range(self.count):
+            idx = (self.head + i) % self.size
+            e = self.buf[idx]
+            if (e.is_branch or e.is_jump) and not e.completed:
+                break          # this branch is unresolved -> stop the run
+            last = idx
+        return last
+
+    def newest_store_idx(self) -> Optional[int]:
+        """Index of the youngest store currently in the ROB (None if none)."""
+        found = None
+        for i in range(self.count):
+            idx = (self.head + i) % self.size
+            if self.buf[idx].is_store:
+                found = idx
+        return found
+
     def clear(self) -> None:
         self.buf = [None] * self.size
         self.head = self.tail = self.count = 0
 
 
 # ===========================================================================
-# Reservation stations (3 split stations, tags only -- no operand data)
+# Reservation stations (4 split stations, tags only -- no operand data)
 # ===========================================================================
 @dataclass
 class RSEntry:
+    """One reservation-station slot.
+
+    Per the RTL field diagrams the slot carries, besides the physical source
+    tags (held on the referenced :class:`DynInst`), a *valid* bit per source
+    operand: ``v1`` for source 1 and ``v2`` for source 2.  A bit is set when the
+    operand value is available in the PRF.  Unused sources keep their valid bit
+    ``True`` so they never gate selection.  The single-source Branch RS uses
+    ``v1`` as its lone ``valid`` bit (``v2`` stays ``True``).
+    """
     busy: bool = False
     dyn: Optional[DynInst] = None
     issued: bool = False       # already sent to a functional unit?
+    v1: bool = True            # source-1 valid bit
+    v2: bool = True            # source-2 valid bit
+
+    def ready(self) -> bool:
+        """Selectable iff both operand valid bits are set and not yet issued."""
+        return self.busy and not self.issued and self.v1 and self.v2
 
     def clear(self) -> None:
         self.busy = False
         self.dyn = None
         self.issued = False
+        self.v1 = True
+        self.v2 = True
 
 
 class ReservationStation:
     """A fixed-size pool of RS entries dedicated to one FU class.
 
-    Entries store only physical tags (via the referenced DynInst); operand
-    readiness is determined by indexing the global ReadyTable at select time.
+    Entries store only physical tags (via the referenced DynInst) plus the
+    per-source valid bits.  ``kind`` identifies the station ("int", "muldiv",
+    "loadstore", "branch") and selects the field layout shown in the GUI/console.
     """
-    def __init__(self, name: str, size: int):
+    def __init__(self, name: str, size: int, kind: str):
         self.name = name
+        self.kind = kind
         self.entries = [RSEntry() for _ in range(size)]
 
     def free_slot(self) -> Optional[RSEntry]:
@@ -298,12 +366,24 @@ class ReservationStation:
     def full(self) -> bool:
         return all(e.busy for e in self.entries)
 
-    def insert(self, dyn: DynInst) -> None:
+    def insert(self, dyn: DynInst, v1: bool = True, v2: bool = True) -> None:
         slot = self.free_slot()
         assert slot is not None
         slot.busy = True
         slot.dyn = dyn
         slot.issued = False
+        slot.v1 = v1
+        slot.v2 = v2
+
+    def wake(self, tag: int) -> None:
+        """CDB broadcast: set the valid bit of every entry sourcing ``tag``."""
+        for e in self.entries:
+            if not e.busy:
+                continue
+            if e.dyn.ps1 == tag:
+                e.v1 = True
+            if e.dyn.ps2 == tag:
+                e.v2 = True
 
     def remove(self, dyn: DynInst) -> None:
         for e in self.entries:

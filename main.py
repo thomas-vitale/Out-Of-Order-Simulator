@@ -127,21 +127,44 @@ def print_console(snapshots, program):
         print(f"  RAT(spec!=arch): {_fmt_list(rat_diffs)}")
         print(f"  FreeList: {_fmt_list(['p%d' % p for p in s['free_list']])}")
         if s["rob"]:
-            print("  ROB:")
+            print("  ROB (OPCODE/FUNC, Dest, Finished + pointers):")
             for r in s["rob"]:
-                mark = ">" if r["head"] else " "
-                print(f"   {mark}[{r['rob']:02d}] #{r['seq']:<3d} {r['text']:<16s}"
-                      f" dst={r['dest']:<4s} pd={r['pd']:<4s} old={r['told']:<4s}"
-                      f" {'DONE' if r['done'] else '....'} {r['store']}{r['branch']}")
+                # pointer tags: O=oldest N=newest S=non_speculative_last T=newest_store
+                ptr = ("O" if r["oldest"] else " ") + \
+                      ("N" if r["newest"] else " ") + \
+                      ("S" if r["non_spec_last"] else " ") + \
+                      ("T" if r["newest_store"] else " ")
+                print(f"   {ptr}[{r['rob']:02d}] #{r['seq']:<3d} {r['opcode']:<5s}"
+                      f" {r['text']:<16s} dst={r['dest']:<4s}"
+                      f" {'FIN' if r['finished'] else '...'}"
+                      f"  (pd={r['pd']} old={r['told']}) {r['store']}{r['branch']}")
+        # RS_Int / RS_MulDiv / RS_LoadStore share the S1/V1/S2/V2/Imm/D layout.
         for label, key in (("RS_Int", "rs_int"), ("RS_MulDiv", "rs_muldiv"),
-                           ("RS_LoadBranch", "rs_loadbranch")):
+                           ("RS_LoadStore", "rs_loadstore")):
             rows = s[key]
             if rows:
-                cells = [f"#{r['seq']}({r['op']} s1={r['ps1']} s2={r['ps2']}"
-                         + (f" imm={r['imm']}" if r.get('imm') is not None else "")
-                         + f" pd={r['pd']}{' RDY' if r['ready'] else ''})"
-                         for r in rows]
+                cells = []
+                for r in rows:
+                    extra = ""
+                    if r.get("imm") is not None:
+                        extra += f" imm={r['imm']}"
+                    if r.get("is_store"):
+                        extra += " STORE"
+                    cells.append(
+                        f"#{r['seq']}({r['op']} s1={r['s1']}{'+' if r['v1'] else '.'}"
+                        f" s2={r['s2']}{'+' if r['v2'] else '.'}{extra}"
+                        f" d={r['d']}{' RDY' if r['ready'] else ''})")
                 print(f"  {label}: " + " | ".join(cells))
+        # RS_Branch has its own field layout: reg, V, imm, use_reg, is_cond.
+        if s["rs_branch"]:
+            cells = []
+            for r in s["rs_branch"]:
+                kind = "cond" if r["is_cond"] else ("reg" if r["use_reg"] else "imm")
+                tgt = f" off={r['imm']}" if r["imm"] is not None else ""
+                cells.append(
+                    f"#{r['seq']}({r['op']} reg={r['reg']}{'+' if r['v'] else '.'}"
+                    f"{tgt} [{kind}]{' RDY' if r['ready'] else ''})")
+            print("  RS_Branch: " + " | ".join(cells))
         busy = [f"{f['name']}[" + ",".join(f"#{sl['seq']}({sl['remaining']}"
                 f"{'D' if sl['done'] else ''})" for sl in f["slots"]) + "]"
                 for f in s["fus"] if f["slots"]]

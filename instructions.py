@@ -11,11 +11,13 @@ used to compute its result.  The pipeline timing lives elsewhere
 (``simulator.py``); here we only model *what* an instruction computes, not
 *when*.
 
-Three reservation-station classes (per the project decision):
+Four reservation-station classes (one per functional-unit cluster, matching the
+RTL field diagrams):
 
-  * ``FUClass.INT``         -> RS_Int      : ADD/SUB/AND/OR/XOR/shift/SLT (+imm)
-  * ``FUClass.MULDIV``      -> RS_MulDiv   : MULT, DIV
-  * ``FUClass.LOADBRANCH``  -> RS_LoadBranch: LW, SW, BEQZ/BNEZ, J/JR/JAL/JALR
+  * ``FUClass.INT``        -> RS_Int       : ADD/SUB/AND/OR/XOR/shift/SLT (+imm)
+  * ``FUClass.MULDIV``     -> RS_MulDiv    : MULT, DIV
+  * ``FUClass.LOADSTORE``  -> RS_LoadStore : LW, SW
+  * ``FUClass.BRANCH``     -> RS_Branch    : BEQZ/BNEZ, J/JR/JAL/JALR
 
 Register convention: DLX has 32 architectural GPRs (R0..R31).  R0 is hardwired
 to zero -- writes to it are discarded and it never consumes a physical register
@@ -42,9 +44,10 @@ def w32(x: int) -> int:
 
 class FUClass(Enum):
     """Which reservation station / functional-unit cluster an op uses."""
-    INT = auto()         # RS_Int       -> ALU units
-    MULDIV = auto()      # RS_MulDiv    -> MUL (pipelined) + DIV (non-pipelined)
-    LOADBRANCH = auto()  # RS_LoadBranch -> Load/Store unit + Branch unit
+    INT = auto()        # RS_Int       -> ALU units
+    MULDIV = auto()     # RS_MulDiv    -> MUL (pipelined) + DIV (non-pipelined)
+    LOADSTORE = auto()  # RS_LoadStore -> Load/Store unit (LU)
+    BRANCH = auto()     # RS_Branch    -> Branch unit (BU)
 
 
 class Opcode(Enum):
@@ -69,10 +72,10 @@ class Opcode(Enum):
     # --- multiply / divide (RS_MulDiv) ------------------------------------
     MULT = auto()
     DIV = auto()
-    # --- memory (RS_LoadBranch) -------------------------------------------
+    # --- memory (RS_LoadStore) --------------------------------------------
     LW = auto()
     SW = auto()
-    # --- control flow (RS_LoadBranch) -------------------------------------
+    # --- control flow (RS_Branch) -----------------------------------------
     BEQZ = auto()
     BNEZ = auto()
     J = auto()
@@ -149,18 +152,18 @@ OPINFO: dict[Opcode, OpInfo] = {
     # RS_MulDiv
     Opcode.MULT: OpInfo(FUClass.MULDIV, True, 2, compute=_ALU[Opcode.MULT]),
     Opcode.DIV:  OpInfo(FUClass.MULDIV, True, 2, compute=_ALU[Opcode.DIV]),
-    # RS_LoadBranch -- memory.  LW writes a reg; SW does not.
+    # RS_LoadStore -- memory.  LW writes a reg; SW does not.
     # For both, src1 = base register, imm = offset.  For SW src2 = data reg.
-    Opcode.LW: OpInfo(FUClass.LOADBRANCH, True, 1, use_imm=True, is_load=True),
-    Opcode.SW: OpInfo(FUClass.LOADBRANCH, False, 2, use_imm=True, is_store=True),
-    # RS_LoadBranch -- control.  Conditional branches read 1 reg, write none.
-    Opcode.BEQZ: OpInfo(FUClass.LOADBRANCH, False, 1, is_branch=True),
-    Opcode.BNEZ: OpInfo(FUClass.LOADBRANCH, False, 1, is_branch=True),
+    Opcode.LW: OpInfo(FUClass.LOADSTORE, True, 1, use_imm=True, is_load=True),
+    Opcode.SW: OpInfo(FUClass.LOADSTORE, False, 2, use_imm=True, is_store=True),
+    # RS_Branch -- control.  Conditional branches read 1 reg, write none.
+    Opcode.BEQZ: OpInfo(FUClass.BRANCH, False, 1, is_branch=True),
+    Opcode.BNEZ: OpInfo(FUClass.BRANCH, False, 1, is_branch=True),
     # Unconditional jumps.  J/JR write no reg; JAL/JALR write the link reg R31.
-    Opcode.J:    OpInfo(FUClass.LOADBRANCH, False, 0, is_jump=True),
-    Opcode.JR:   OpInfo(FUClass.LOADBRANCH, False, 1, is_jump=True),
-    Opcode.JAL:  OpInfo(FUClass.LOADBRANCH, True, 0, is_jump=True),
-    Opcode.JALR: OpInfo(FUClass.LOADBRANCH, True, 1, is_jump=True),
+    Opcode.J:    OpInfo(FUClass.BRANCH, False, 0, is_jump=True),
+    Opcode.JR:   OpInfo(FUClass.BRANCH, False, 1, is_jump=True),
+    Opcode.JAL:  OpInfo(FUClass.BRANCH, True, 0, is_jump=True),
+    Opcode.JALR: OpInfo(FUClass.BRANCH, True, 1, is_jump=True),
     # No-op
     Opcode.NOP:  OpInfo(FUClass.INT, False, 0),
 }

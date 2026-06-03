@@ -78,9 +78,13 @@ class Simulator:
 
         # ---- queues / buffers --------------------------------------------
         self.rob = ROB(c.rob_size)
-        self.rs_int = ReservationStation("RS_Int", c.rs_int)
-        self.rs_muldiv = ReservationStation("RS_MulDiv", c.rs_muldiv)
-        self.rs_loadbranch = ReservationStation("RS_LoadBranch", c.rs_loadbranch)
+        self.rs_int = ReservationStation("RS_Int", c.rs_int, "int")
+        self.rs_muldiv = ReservationStation("RS_MulDiv", c.rs_muldiv, "muldiv")
+        self.rs_loadstore = ReservationStation("RS_LoadStore", c.rs_loadstore,
+                                               "loadstore")
+        self.rs_branch = ReservationStation("RS_Branch", c.rs_branch, "branch")
+        self.all_rs = [self.rs_int, self.rs_muldiv, self.rs_loadstore,
+                       self.rs_branch]
 
         # ---- functional units --------------------------------------------
         self.alus = [FunctionalUnit(f"ALU{i}", "ALU", c.lat_alu, pipelined=False)
@@ -194,9 +198,8 @@ class Simulator:
         """Squash all in-flight work younger than the just-committed branch."""
         self.rob.clear()
         self.fetch_q.clear()
-        self.rs_int.clear()
-        self.rs_muldiv.clear()
-        self.rs_loadbranch.clear()
+        for rs in self.all_rs:
+            rs.clear()
         for fu in self.all_fus:
             fu.clear()
 
@@ -249,7 +252,9 @@ class Simulator:
             dyn = slot.dyn
             # ---- the actual CDB broadcast ----
             self.prf.write(dyn.pd, dyn.result)   # write data into the PRF
-            self.ready.set(dyn.pd)               # wake up waiting consumers
+            self.ready.set(dyn.pd)               # global ready status (for dispatch)
+            for rs in self.all_rs:               # Tomasulo wakeup: tag-match
+                rs.wake(dyn.pd)                  # set V1/V2 of matching RS entries
             self._finalize_rob(dyn)              # mark ROB entry completed
             fu.release(slot)
             broadcasts.append((dyn.pd, dyn.result, dyn.seq))
@@ -286,14 +291,6 @@ class Simulator:
     # =====================================================================
     # Stage 3: ISSUE / SELECT (wakeup + operand read + dispatch to FU)
     # =====================================================================
-    def _src_ready(self, dyn: DynInst) -> bool:
-        """A source tag is ready iff it is unused or its Ready Table bit is set."""
-        if dyn.ps1 is not None and not self.ready.is_ready(dyn.ps1):
-            return False
-        if dyn.ps2 is not None and not self.ready.is_ready(dyn.ps2):
-            return False
-        return True
-
     def _older_store_pending(self, load_seq: int) -> bool:
         """Conservative load disambiguation: true while an older store is still
         in the ROB (i.e. has not yet committed to memory)."""
@@ -301,6 +298,18 @@ class Simulator:
             if e.is_store and e.seq < load_seq:
                 return True
         return False
+
+    def _is_non_speculative(self, dyn: DynInst) -> bool:
+        """True if ``dyn``'s ROB entry lies in the non-speculative region
+        (no older *unresolved* branch shadows it)."""
+        ns = self.rob.non_speculative_last_idx()
+        if ns is None:
+            return False
+        # Distance from head, comparing program-order positions in the ROB.
+        head = self.rob.head
+        pos = (dyn.rob_idx - head) % self.rob.size
+        ns_pos = (ns - head) % self.rob.size
+        return pos <= ns_pos
 
     def _issue_to(self, fu: FunctionalUnit, dyn: DynInst) -> None:
         # Read operand *values* from the PRF now (they are guaranteed ready).
@@ -312,9 +321,12 @@ class Simulator:
         self._ev["issued"].append(dyn.short())
 
     def _issue(self) -> None:
+        # Selection now reads the per-entry V1/V2 valid bits (RSEntry.ready()),
+        # not the global Ready Table: classic Tomasulo wakeup.
+
         # --- RS_Int -> ALUs ---
         for e in sorted(self.rs_int.live(), key=lambda x: x.dyn.seq):
-            if e.issued or not self._src_ready(e.dyn):
+            if not e.ready():
                 continue
             fu = next((u for u in self.alus if u.can_accept()), None)
             if fu is None:
@@ -324,7 +336,7 @@ class Simulator:
 
         # --- RS_MulDiv -> MUL / DIV ---
         for e in sorted(self.rs_muldiv.live(), key=lambda x: x.dyn.seq):
-            if e.issued or not self._src_ready(e.dyn):
+            if not e.ready():
                 continue
             fu = self.mul if e.dyn.op == Opcode.MULT else self.div
             if not fu.can_accept():
@@ -332,21 +344,31 @@ class Simulator:
             self._issue_to(fu, e.dyn)
             self.rs_muldiv.remove(e.dyn)
 
-        # --- RS_LoadBranch -> LU (loads/stores) / BU (branches/jumps) ---
-        for e in sorted(self.rs_loadbranch.live(), key=lambda x: x.dyn.seq):
-            if e.issued or not self._src_ready(e.dyn):
+        # --- RS_LoadStore -> LU ---
+        for e in sorted(self.rs_loadstore.live(), key=lambda x: x.dyn.seq):
+            if not e.ready():
                 continue
             inst = e.dyn.inst
-            if inst.is_load or inst.is_store:
-                if inst.is_load and self._older_store_pending(e.dyn.seq):
-                    continue  # wait: an older store has not committed yet
-                fu = self.lu
-            else:
-                fu = self.bu
-            if not fu.can_accept():
+            if inst.is_load:
+                # Conservative load: must be non-speculative AND have no older
+                # uncommitted store ahead of it.
+                if not self._is_non_speculative(e.dyn):
+                    continue
+                if self._older_store_pending(e.dyn.seq):
+                    continue
+            if not self.lu.can_accept():
+                break
+            self._issue_to(self.lu, e.dyn)
+            self.rs_loadstore.remove(e.dyn)
+
+        # --- RS_Branch -> BU ---
+        for e in sorted(self.rs_branch.live(), key=lambda x: x.dyn.seq):
+            if not e.ready():
                 continue
-            self._issue_to(fu, e.dyn)
-            self.rs_loadbranch.remove(e.dyn)
+            if not self.bu.can_accept():
+                break
+            self._issue_to(self.bu, e.dyn)
+            self.rs_branch.remove(e.dyn)
 
     def _compute(self, dyn: DynInst) -> None:
         """Compute the functional result of an instruction (executed at issue)."""
@@ -424,8 +446,13 @@ class Simulator:
             )
             dyn.rob_idx = self.rob.alloc(entry)
 
-            # ---- allocate the reservation-station entry (tags only) ----
-            rs.insert(dyn)
+            # ---- allocate the reservation-station entry (tags + valid bits) --
+            # Initialise the per-source valid bits from the global Ready Table:
+            # a source is valid now iff it is unused or its producer already
+            # broadcast.  Subsequent producers wake the entry via rs.wake().
+            v1 = dyn.ps1 is None or self.ready.is_ready(dyn.ps1)
+            v2 = dyn.ps2 is None or self.ready.is_ready(dyn.ps2)
+            rs.insert(dyn, v1, v2)
             dyn.stage = "dispatch"
             self._ev["dispatched"].append(dyn.short())
 
@@ -434,7 +461,9 @@ class Simulator:
             return self.rs_int
         if fu == FUClass.MULDIV:
             return self.rs_muldiv
-        return self.rs_loadbranch
+        if fu == FUClass.LOADSTORE:
+            return self.rs_loadstore
+        return self.rs_branch
 
     # =====================================================================
     # Stage 1: FETCH (with branch prediction; follows the predicted stream)
@@ -473,9 +502,7 @@ class Simulator:
         drained = (self.pc >= len(self.program)
                    and not self.fetch_q
                    and self.rob.empty()
-                   and not self.rs_int.live()
-                   and not self.rs_muldiv.live()
-                   and not self.rs_loadbranch.live()
+                   and all(not rs.live() for rs in self.all_rs)
                    and all(not fu.slots for fu in self.all_fus))
         if drained:
             self.halted = True
@@ -483,28 +510,46 @@ class Simulator:
     # =====================================================================
     # Snapshot: an immutable picture of the whole machine for the GUI.
     # =====================================================================
-    def _ready_str(self, p: Optional[int]) -> str:
-        if p is None:
-            return "-"
-        return f"p{p}{'+' if self.ready.is_ready(p) else '.'}"
+    @staticmethod
+    def _tag(p: Optional[int]) -> str:
+        return f"p{p}" if p is not None else "-"
 
     def _rs_rows(self, rs: ReservationStation) -> list[dict]:
+        """Build display rows whose keys match the RTL field diagram for the
+        station's ``kind``."""
         rows = []
         for e in rs.live():
             d = e.dyn
-            rows.append({
+            inst = d.inst
+            base = {
                 "seq": d.seq,
                 "op": d.op.name,
-                "text": d.inst.text,
-                "ps1": self._ready_str(d.ps1),
-                "ps2": self._ready_str(d.ps2),
-                "pd": f"p{d.pd}" if d.pd is not None else "-",
+                "text": inst.text,
                 "rob": d.rob_idx,
-                # Immediate stored in the RS entry (only meaningful for ops that
-                # use an immediate: ALU-imm, LW/SW offset). None otherwise.
-                "imm": (d.inst.imm if d.inst.use_imm else None),
-                "ready": self._src_ready(d),
-            })
+                "ready": e.ready(),
+            }
+            if rs.kind == "branch":
+                # Branch-Unit fields: reg, V(valid), imm(offset), use_reg, is_cond
+                use_reg = inst.op in (Opcode.JR, Opcode.JALR)
+                base.update({
+                    "reg": self._tag(d.ps1),
+                    "v": e.v1,
+                    "imm": (None if use_reg else inst.target_idx),
+                    "use_reg": use_reg,
+                    "is_cond": inst.is_branch,
+                })
+            else:
+                # Int / MulDiv / LoadStore fields: S1,V1,S2,V2,Imm,is_imm,D,ROB
+                base.update({
+                    "s1": self._tag(d.ps1), "v1": e.v1,
+                    "s2": self._tag(d.ps2), "v2": e.v2,
+                    "imm": (inst.imm if inst.use_imm else None),
+                    "is_imm": inst.use_imm,
+                    "d": self._tag(d.pd),
+                })
+                if rs.kind == "loadstore":
+                    base["is_store"] = inst.is_store
+            rows.append(base)
         return rows
 
     def _fu_rows(self) -> list[dict]:
@@ -523,18 +568,30 @@ class Simulator:
     def _rob_rows(self) -> list[dict]:
         rows = []
         head = self.rob.head
+        ns = self.rob.non_speculative_last_idx()
+        newest_store = self.rob.newest_store_idx()
+        newest = self.rob.newest_idx()
         for i in range(self.rob.count):
             idx = (head + i) % self.rob.size
             e = self.rob.buf[idx]
             rows.append({
                 "rob": idx,
                 "head": i == 0,
+                # ---- maintained ROB pointers (RTL field diagram) ----
+                "oldest": idx == self.rob.oldest_idx(),
+                "newest": idx == newest,
+                "non_spec_last": idx == ns,
+                "newest_store": idx == newest_store,
+                # ---- diagram fields: OPCODE/FUNC, Dest(arch), Finished ----
                 "seq": e.seq,
+                "opcode": e.dyn.op.name,
                 "text": e.dyn.inst.text,
                 "dest": f"R{e.arch_dest}" if e.arch_dest is not None else "-",
+                "finished": e.completed,
+                # ---- internal rename bookkeeping (not in the simplified RTL
+                #      diagram, but needed for PRF->ARF copy + free-list recycle)
                 "pd": f"p{e.pd}" if e.pd is not None else "-",
                 "told": f"p{e.told}" if e.told is not None else "-",
-                "done": e.completed,
                 "store": (f"M[{e.st_addr}]={e.st_data}"
                           if e.is_store and e.st_addr is not None else
                           ("store" if e.is_store else "")),
@@ -566,9 +623,16 @@ class Simulator:
             "mem": dict(self.mem.mem),
             # queues
             "rob": self._rob_rows(),
+            "rob_ptrs": {
+                "oldest": self.rob.oldest_idx(),
+                "newest": self.rob.newest_idx(),
+                "non_spec_last": self.rob.non_speculative_last_idx(),
+                "newest_store": self.rob.newest_store_idx(),
+            },
             "rs_int": self._rs_rows(self.rs_int),
             "rs_muldiv": self._rs_rows(self.rs_muldiv),
-            "rs_loadbranch": self._rs_rows(self.rs_loadbranch),
+            "rs_loadstore": self._rs_rows(self.rs_loadstore),
+            "rs_branch": self._rs_rows(self.rs_branch),
             "fus": self._fu_rows(),
             # branch predictor: BHT of 2-bit saturating counters + BTB
             "bht": list(self.bp.bht),

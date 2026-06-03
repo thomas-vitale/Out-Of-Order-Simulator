@@ -21,8 +21,13 @@ uses a **Ready Table** (indexed bit array) instead of associative tag matching.
 - Explicit register renaming, **PRF holds data**, RS/ROB hold **physical tags only**.
 - **2-way superscalar** (fetch/dispatch/commit width = 2).
 - PRF = 64, ROB = 32, **CDB = 2 ports**.
-- **Ready Table** wakeup (no CAM): writeback sets the bit, rename clears it, RS
-  indexes it at select.
+- **Per-entry V1/V2 valid bits** (Tomasulo-style wakeup, matching the RTL RS
+  field diagrams): each RS entry holds a valid bit per source; initialised from
+  the `ReadyTable` at dispatch, set by CDB tag-match broadcast (`RS.wake(tag)`),
+  read at select via `RSEntry.ready()`. The `ReadyTable` is kept only for
+  dispatch-time init, flush rebuild, and GUI display. *(Earlier revisions used
+  the Ready Table directly at select; this was switched to per-entry V1/V2 to
+  mirror the RTL.)*
 - **Stores live in the ROB**; memory is written only at **commit** (precise).
 - **Conservative loads**: a load may execute only once all older stores have
   committed (no associative address disambiguation).
@@ -31,11 +36,25 @@ uses a **Ready Table** (indexed bit array) instead of associative tag matching.
 
 ## Deviations / resolved open questions
 
-- **3 split reservation stations** (per the user's request, *overriding* the
-  doc's unified 16-entry pool):
-  - `RS_LoadBranch` → loads, stores, branches, jumps
-  - `RS_Int` → ADD/SUB/AND/OR/XOR/SLL/SRL/SLT (+ immediate forms)
-  - `RS_MulDiv` → MULT (pipelined), DIV (non-pipelined)
+- **4 split reservation stations** (one per FU cluster, matching the RTL field
+  diagrams; *overriding* the doc's unified 16-entry pool). `FUClass` =
+  INT/MULDIV/LOADSTORE/BRANCH; each RS row carries the diagram's named fields:
+  - `RS_Int` → ALU ops (ADD/SUB/AND/OR/XOR/SLL/SRL/SLT + imm). Fields:
+    `S1,V1,S2,V2,Imm,is_imm,D,ROB` (+ ALU opcode = the Op).
+  - `RS_MulDiv` → MULT (pipelined), DIV (non-pipelined). Same generic fields.
+  - `RS_LoadStore` → LW/SW (→ LU). Generic fields + `is_store`; S1=base,
+    S2=store data, Imm=offset, D=load dest.
+  - `RS_Branch` → BEQZ/BNEZ/J/JR/JAL/JALR (→ BU). Fields: `reg, V, imm(off),
+    use_reg, is_conditional, ROB` (single source = the flag/target reg).
+  *(Earlier revisions had 3 stations with a combined `RS_LoadBranch`; the RTL
+  diagrams split load/store from branch, so loads/stores→LU and branches→BU.
+  The load/store RS layout is inferred — no LSU diagram was provided.)*
+- **ROB pointers** (RTL field diagram): besides `OPCODE/FUNC, Dest, Finished`,
+  the ROB maintains `oldest`(head) / `newest`(tail) / `non_speculative_last` /
+  `newest_store`. `non_speculative_last` gates load issue (a load may execute
+  only when non-speculative, i.e. no older unresolved branch shadows it);
+  `newest_store` tracks store ordering. `pd`/`told` stay as internal rename
+  bookkeeping (needed for PRF→ARF copy + free-list recycle; not in the diagram).
 - **Recovery (doc §8.2)**: implemented with **two RATs** — speculative `RAT` and
   committed `arch_rat`. On flush: `RAT = arch_rat`, rebuild free list as "all
   phys regs not referenced by `arch_rat`", reset Ready Table to committed regs.
@@ -69,7 +88,7 @@ uses a **Ready Table** (indexed bit array) instead of associative tag matching.
 |---|---|
 | `instructions.py` | `Opcode`/`FUClass` enums, `Instruction`, opcode→(RS, semantics, flags) table, `w32` |
 | `parser.py` | two-pass DLX assembler (labels, comments `;`/`#`/`//`, `off(base)`) |
-| `structures.py` | `Config`, `DynInst`, PRF/ARF/RAT/FreeList/ReadyTable/ROB, 3 RS, FU model, DataMemory, BranchPredictor |
+| `structures.py` | `Config`, `DynInst`, PRF/ARF/RAT/FreeList/ReadyTable/ROB (+pointers), 4 RS (V1/V2 valid bits, per-kind), FU model, DataMemory, BranchPredictor |
 | `simulator.py` | the pipeline + per-cycle `CycleSnapshot` (dict); flush/recovery |
 | `gui.py` | Tkinter snapshot viewer (Prev/Next/Reset/End + arrow keys) |
 | `main.py` | entry point (GUI default, `--console`), golden in-order self-check |
@@ -112,9 +131,10 @@ committed ARF + memory are asserted equal to it. Keep this invariant when editin
 - ROB entries are keyed by `seq`; loads scan the ROB for older pending stores.
 - **Memory ordering**: stores write `DataMemory` *only at commit* (`_commit`);
   speculative stores never touch memory. Loads are conservative — `_issue` blocks
-  a load while `_older_store_pending(seq)` is true (any `is_store` with smaller
-  `seq` still in the ROB), so a load only executes once every older store has
-  committed. No address-matching CAM.
+  a load unless it is **non-speculative** (`_is_non_speculative`, via the ROB's
+  `non_speculative_last` pointer) **and** no older store is still pending
+  (`_older_store_pending(seq)`). So a load executes only once every older branch
+  has resolved and every older store has committed. No address-matching CAM.
 - **RS hold the immediate too**: each reservation-station entry carries the
   instruction's immediate (offset for `LW/SW`, literal for ALU-imm). Surfaced as
   `imm` in `_rs_rows`, the GUI **"Imm"** column, and the `--console` RS dump

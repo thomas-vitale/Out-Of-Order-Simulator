@@ -149,9 +149,12 @@ class OoOViewer:
         col1 = ttk.PanedWindow(outer, orient=tk.VERTICAL)
         outer.add(col1, weight=3)
         f, self.t_rob = self._make_tree(
-            col1, ("ROB", "Seq", "Instr", "Dst", "pd", "old", "St", "Done"),
-            (40, 40, 150, 40, 40, 40, 90, 45),
-            height=14, title="Reorder Buffer (head = oldest)")
+            col1,
+            ("ROB", "Ptr", "Seq", "Opcode", "Instr", "Dest", "Fin",
+             "pd", "old", "St"),
+            (38, 44, 38, 55, 140, 45, 36, 40, 40, 80),
+            height=14,
+            title="Reorder Buffer  (Ptr: O=oldest N=newest S=non-spec-last T=newest-store)")
         col1.add(f, weight=3)
         f, self.t_prf = self._make_tree(
             col1, ("Phys", "Value", "Hex", "Rdy", "Arch"),
@@ -159,19 +162,30 @@ class OoOViewer:
             height=12, title="Physical Register File (values)")
         col1.add(f, weight=2)
 
-        # --- column 2 (vertical paned): RS x3, FUs, CDB, pipeline ---
+        # --- column 2 (vertical paned): RS x4, FUs, CDB, pipeline ---
         col2 = ttk.PanedWindow(outer, orient=tk.VERTICAL)
         outer.add(col2, weight=3)
-        rs_cols = ("Seq", "Op", "src1", "src2", "Imm", "pd", "ROB", "Rdy")
-        rs_w = (40, 55, 50, 50, 50, 40, 40, 40)
-        f, self.t_rs_lb = self._make_tree(col2, rs_cols, rs_w, height=4,
-                                          title="RS_LoadBranch")
+        # RS_Int / RS_MulDiv share the S1,V1,S2,V2,Imm,is_imm,D,ROB layout.
+        gen_cols = ("Seq", "Op", "S1", "V1", "S2", "V2", "Imm", "D", "ROB", "Rdy")
+        gen_w = (38, 52, 42, 28, 42, 28, 42, 42, 38, 36)
+        f, self.t_rs_int = self._make_tree(col2, gen_cols, gen_w, height=4,
+                                           title="RS_Int  (ALU)")
         col2.add(f, weight=2)
-        f, self.t_rs_int = self._make_tree(col2, rs_cols, rs_w, height=4,
-                                           title="RS_Int")
-        col2.add(f, weight=2)
-        f, self.t_rs_md = self._make_tree(col2, rs_cols, rs_w, height=3,
+        f, self.t_rs_md = self._make_tree(col2, gen_cols, gen_w, height=3,
                                           title="RS_MulDiv")
+        col2.add(f, weight=2)
+        # RS_LoadStore adds the is_store flag column.
+        ls_cols = ("Seq", "Op", "S1", "V1", "S2", "V2", "Imm", "Str", "D",
+                   "ROB", "Rdy")
+        ls_w = (38, 52, 42, 28, 42, 28, 42, 34, 42, 38, 36)
+        f, self.t_rs_ls = self._make_tree(col2, ls_cols, ls_w, height=3,
+                                          title="RS_LoadStore  (LU)")
+        col2.add(f, weight=2)
+        # RS_Branch has its own field layout (reg, V, off, use_reg, is_cond).
+        br_cols = ("Seq", "Op", "Reg", "V", "Off", "UseReg", "Cond", "ROB", "Rdy")
+        br_w = (38, 52, 42, 28, 44, 50, 44, 38, 36)
+        f, self.t_rs_br = self._make_tree(col2, br_cols, br_w, height=3,
+                                          title="RS_Branch  (BU)")
         col2.add(f, weight=2)
         f, self.t_fu = self._make_tree(
             col2, ("Unit", "Kind", "Instr(seq)", "Left", "St"),
@@ -236,12 +250,15 @@ class OoOViewer:
         self._render_free(snap, prev)
         self._render_rob(snap, prev)
         self._render_prf(snap, prev)
-        self._render_rs(self.t_rs_lb, snap["rs_loadbranch"],
-                        prev["rs_loadbranch"] if prev else None)
-        self._render_rs(self.t_rs_int, snap["rs_int"],
-                        prev["rs_int"] if prev else None)
-        self._render_rs(self.t_rs_md, snap["rs_muldiv"],
-                        prev["rs_muldiv"] if prev else None)
+        self._render_rs_generic(self.t_rs_int, snap["rs_int"],
+                                prev["rs_int"] if prev else None)
+        self._render_rs_generic(self.t_rs_md, snap["rs_muldiv"],
+                                prev["rs_muldiv"] if prev else None)
+        self._render_rs_generic(self.t_rs_ls, snap["rs_loadstore"],
+                                prev["rs_loadstore"] if prev else None,
+                                store_col=True)
+        self._render_rs_branch(self.t_rs_br, snap["rs_branch"],
+                               prev["rs_branch"] if prev else None)
         self._render_fu(snap, prev)
         self._render_bht(snap, prev)
         self._render_cdb_pipe(snap)
@@ -281,16 +298,20 @@ class OoOViewer:
             extra = r["store"] or r["branch"]
             tags = []
             pr = prev_by_seq.get(r["seq"])
-            if pr is None or pr["done"] != r["done"]:
+            if pr is None or pr["finished"] != r["finished"]:
                 tags.append("changed")
             elif r["head"]:
                 tags.append("head")
-            elif r["done"]:
+            elif r["finished"]:
                 tags.append("done")
+            # maintained ROB pointers (RTL field diagram)
+            ptr = ("O" if r["oldest"] else "") + ("N" if r["newest"] else "") \
+                + ("S" if r["non_spec_last"] else "") \
+                + ("T" if r["newest_store"] else "")
             t.insert("", tk.END, tags=tags, values=(
                 ("▶ " if r["head"] else "") + str(r["rob"]),
-                r["seq"], r["text"], r["dest"], r["pd"], r["told"],
-                extra, "DONE" if r["done"] else ""))
+                ptr, r["seq"], r["opcode"], r["text"], r["dest"],
+                "FIN" if r["finished"] else "", r["pd"], r["told"], extra))
 
     def _render_prf(self, snap, prev):
         """Show every physical register's value, ready bit, and the arch reg(s)
@@ -313,7 +334,13 @@ class OoOViewer:
             t.insert("", tk.END, tags=tags, values=(
                 f"p{p}", val, f"0x{val & 0xFFFFFFFF:08x}", rdy, arch))
 
-    def _render_rs(self, tree, rows, prev_rows):
+    @staticmethod
+    def _vbit(valid: bool) -> str:
+        """Render a valid bit the way the RTL V1/V2 fields read: 1 = ready."""
+        return "1" if valid else "0"
+
+    def _render_rs_generic(self, tree, rows, prev_rows, store_col=False):
+        """Render an Int / MulDiv / LoadStore station (S1,V1,S2,V2,Imm,[Str],D)."""
         tree.delete(*tree.get_children())
         prev_seqs = {r["seq"] for r in prev_rows} if prev_rows else set()
         for r in rows:
@@ -321,11 +348,27 @@ class OoOViewer:
             if r["ready"] and not tags:
                 tags = ["done"]
             imm = r.get("imm")
+            imm_s = str(imm) if imm is not None else "-"
+            vals = [r["seq"], r["op"], r["s1"], self._vbit(r["v1"]),
+                    r["s2"], self._vbit(r["v2"]), imm_s]
+            if store_col:
+                vals.append("ST" if r.get("is_store") else "")
+            vals += [r["d"], r["rob"], "yes" if r["ready"] else ""]
+            tree.insert("", tk.END, tags=tags, values=tuple(vals))
+
+    def _render_rs_branch(self, tree, rows, prev_rows):
+        """Render the Branch unit station (reg, V, off, use_reg, is_cond)."""
+        tree.delete(*tree.get_children())
+        prev_seqs = {r["seq"] for r in prev_rows} if prev_rows else set()
+        for r in rows:
+            tags = ["changed"] if r["seq"] not in prev_seqs else []
+            if r["ready"] and not tags:
+                tags = ["done"]
+            off = str(r["imm"]) if r["imm"] is not None else "-"
             tree.insert("", tk.END, tags=tags, values=(
-                r["seq"], r["op"], r["ps1"], r["ps2"],
-                str(imm) if imm is not None else "-",
-                r["pd"], r["rob"],
-                "yes" if r["ready"] else ""))
+                r["seq"], r["op"], r["reg"], self._vbit(r["v"]), off,
+                "yes" if r["use_reg"] else "", "yes" if r["is_cond"] else "",
+                r["rob"], "yes" if r["ready"] else ""))
 
     def _render_fu(self, snap, prev):
         t = self.t_fu
